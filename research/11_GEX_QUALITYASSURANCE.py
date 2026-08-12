@@ -1,60 +1,190 @@
-#!/usr/bin/env python3
 """
-11_gex_qa.py -- Snapshot data-quality assurance + GEX engine, with a known-answer self-test.
+IS THE COLLECTED OPTION SNAPSHOT FIT TO COMPUTE GAMMA AT ALL?
+==============================================================
 
-PURPOSE
-    Decide whether the collected yfinance option snapshots are fit for gamma-exposure work
-    BEFORE months of collection accumulate. A config problem found today is a config change.
-    The same problem found in six months costs six months.
+"QA" is quality assurance: checking the data is fit to use, as opposed to
+analysing it. Those are different jobs with opposite time profiles. Analysis
+improves with more data. This gets no better after the first snapshot, and
+delaying it means every later snapshot inherits whatever is already wrong.
 
-TWO MODES
-    python 11_gex_qa.py --selftest
-        Runs every check against synthetic chains with analytically known answers.
-        Tests BOTH directions: detectors must fire on injected defects AND stay silent
-        on clean data. Exits nonzero on any failure. Run this before trusting real output.
+WHAT THIS ASKS
+    Not "what is the GEX". The question is whether the daily yfinance snapshots
+    in data/ are good enough to build a gamma dataset on, and whether the code
+    that computes gamma can be trusted.
 
-    python 11_gex_qa.py --snapshot data/2026-08-12/SPY.csv.gz --spot 770.56
-        Runs QA + GEX on a real snapshot. --spot is optional if the file has a spot column.
+    A config problem found today is a config change. The same problem found in
+    six months costs six months of collection.
 
-DESIGN NOTES (read these, they are the load-bearing assumptions)
-    1. No risk-free rate is stored in the snapshot and none is needed. The discount factor D
-       and forward F are recovered per-expiry from put-call parity:  C - P = D*(F - K).
-       Regressing (C-P) on K gives slope -D and intercept D*F. This is self-contained, handles
-       dividends correctly, and the regression R^2 is itself a strong data-integrity test.
-       Using raw spot instead of the parity forward biases gamma on dividend-paying ETFs.
-    2. Gamma is computed from the forward:
+WHAT IT CHECKS
+    1. Strike coverage. Not "how many strikes" but whether the strikes the
+       chain does NOT cover would have carried any gamma. Measured empirically
+       as the share of gross gamma sitting on the outermost strikes.
+    2. Implied volatility sanity, including yfinance's failed-inversion
+       sentinel, and a comparison against IV re-inverted from the stored quotes.
+    3. Open interest presence and concentration.
+    4. Quote integrity via put-call parity, which also recovers the forward.
+    5. Whether the flip level is even well defined under each dealer convention.
+
+FIVE ASSUMPTIONS WORTH ARGUING WITH
+    1. NO RISK-FREE RATE IS STORED OR NEEDED. The discount factor D and forward
+       F come from put-call parity, C - P = D*(F - K), by regressing the mid
+       price difference on strike. Slope is -D, intercept is D*F. This is
+       self-contained, handles dividends correctly, and the regression R-squared
+       is itself a strong quote-integrity test. Using raw spot instead of the
+       parity forward biases gamma on a dividend-paying ETF.
+
+    2. GAMMA IS COMPUTED FROM THE FORWARD.
            gamma = D * (F/S) * phi(d1) / (S * sigma * sqrt(T))
            d1    = (ln(F/K) + 0.5*sigma^2*T) / (sigma*sqrt(T))
-       Calls and puts have identical gamma. The self-test verifies this against a finite
-       difference of the pricer, which is a genuine known-answer check rather than a
-       restatement of the same formula.
-    3. Dealer sign conventions. The naive framing "test convention A vs convention B" is
-       partly a trap: if B is defined as the exact negation of A, the zero-gamma flip level
-       is IDENTICAL under both and only the interpretation flips. That reduces to estimating
-       one correlation and reading its sign, which is one bit of information, not two models.
-       Conventions that actually move the flip level must be non-uniform across strikes.
-       Three are implemented here; only the moneyness-conditional one is a distinct model.
-    4. GROSS gamma is computed alongside every signed convention and should be treated as the
-       null. If unsigned gross gamma forecasts realised volatility as well as signed net GEX,
-       then the sign convention is not doing any work and you are measuring "there are a lot
-       of options outstanding", which is a proxy for market cap and volume.
-    5. Flip level is found by re-pricing gamma across a grid of hypothetical spots, not by
-       reading off the current-spot curve. Sticky-strike is the default (each strike keeps its
-       IV); sticky-moneyness is also reported. These disagree, and that disagreement is itself
-       a result worth logging.
+       Calls and puts have identical gamma. The self-test checks this against a
+       finite difference of the pricer, which is an independent computation
+       rather than a restatement of the same formula.
+
+    3. THE "CONVENTION A VS CONVENTION B" FRAMING PARTLY COLLAPSES. If B is the
+       exact negation of A, the zero-gamma flip level is IDENTICAL under both
+       and only the interpretation flips. That is one correlation whose sign you
+       read, not two competing models. A convention that actually moves the flip
+       level has to be non-uniform across strikes, so a moneyness-conditional
+       one is included as the only genuinely distinct third option.
+
+    4. GROSS UNSIGNED GAMMA IS THE NULL. It is computed alongside every signed
+       convention. If it forecasts realised volatility as well as signed net
+       GEX, the sign convention is doing no work and the measurement is really
+       "there are a lot of options outstanding", a proxy for market cap.
+
+    5. FLIP LEVEL IS SOLVED BY RE-PRICING gamma across a grid of hypothetical
+       spots, not by reading the current-spot curve. Sticky-strike and
+       sticky-moneyness are both reported. They disagree, and the disagreement
+       is a result rather than a detail to suppress.
 
 WHAT THIS DOES NOT DO
-    It does not decide which dealer sign convention is correct. That needs months of snapshots
-    plus realised volatility, and see the power note in the report footer before assuming six
-    months will settle it.
+    It does not decide which dealer sign convention is correct. Net GEX is a
+    stock variable, so daily observations are heavily autocorrelated: 125
+    trading days at AR(1) = 0.95 is an effective sample size of 3.2, against the
+    47 independent observations needed to detect the sign of a correlation at a
+    generous rho = 0.40. Test CHANGES in GEX, not levels.
+
+WHAT BROKE WHILE BUILDING THIS
+    Recorded because the failures transfer better than the result does, and
+    because whoever edits this next should know which mistakes are already paid
+    for. Ten bugs, grouped by what it took to find them.
+
+    FOUND BY THE SELF-TEST, before any real data was touched
+
+      1. The flip solver invented a level out of nothing. With zero open
+         interest the net-GEX curve is identically zero, so the zero-crossing
+         detector fired at every grid point and returned a confident 100.0 for a
+         chain containing no positions. A null input has to return a null
+         answer. Guarded now, and the guard is asserted by a test.
+
+      2. The missing-strike detector false-alarmed on every realistic chain. It
+         assumed uniform strike spacing, so the ordinary $1-near-the-money to
+         $5-in-the-tails ladder read as hundreds of dropped strikes. A gap now
+         counts as a hole only if it is large relative to the spacing on BOTH
+         sides, which separates a dropped strike from a spacing regime change.
+
+      3. A threshold compared a count of strikes against a fraction of the ROW
+         count. Dimensionally incoherent: it made the flag half as sensitive for
+         every extra option type and scaled with expiry count for no reason.
+
+      4. Duplicate contracts expanded the parity join into a cartesian product,
+         misaligning the call and put legs.
+
+    FOUND ONLY BY REAL DATA, after the self-test was passing 28/28
+
+      5. The IV sentinel test looked for IV == 0. yfinance does not write zero
+         when its own inversion fails, it writes about 1e-5. The test walked
+         past 144 bad SPY contracts and fed a 0.001% volatility into a
+         denominator.
+
+      6. The parity fit rejected any discount factor above 1.0001. SPY, QQQ and
+         IWM options are AMERICAN. Early exercise breaks put-call parity into an
+         inequality band, which biases the fitted discount factor above 1. This
+         rejected 15 of 17 SPY expiries whose regressions were R2 = 0.9999, and
+         silently shrank a downstream sample from 231 contracts to 34.
+
+      7. The implied carry was averaged over all expiries including 0 DTE, where
+         dividing a sub-cent price difference by a T of about 0.001 returns +18%
+         annualised. Restricted to 14 DTE and longer it returns +2.89%, which is
+         the right answer.
+
+      8. The stored-IV comparison drew its sample only from expiries passing the
+         broken gate in bug 6, so it ran on 34 contracts and still printed a
+         verdict on the data provider's IV field.
+
+      9. The loader dropped dte <= 0, silently deleting the 0-DTE chain, which
+         is the single largest gamma concentration in the file.
+
+    FOUND ONLY BY RUNNING IT ON A SECOND MACHINE
+
+     10. The sticky-moneyness smile had duplicate x-values. Every strike carries
+         a call and a put at the same log-moneyness, so the smile held 577
+         points at 321 distinct positions. np.interp requires strictly
+         increasing x and is undefined on ties, and np.argsort defaults to a
+         NON-STABLE quicksort, so which duplicate landed first depended on the
+         numpy build. Same input, same code, flip level 766.82 in one
+         environment against 767.71 in another.
+
+         Fixing it forced a decision about what to do when a call and a put
+         disagree at the same strike, which is how the call-vs-put IV check came
+         to exist, which is what showed the stored IV field is unusable. The bug
+         was worth more than the fix.
+
+    TWO PREDICTIONS THAT WERE WRONG
+
+      Strike coverage was predicted to be the problem. From "5,736 contracts,
+      all within 90 days" the estimate was roughly 60 expiries and therefore
+      about 48 strikes each, plus or minus 3% of spot. The real file has 17
+      expiries with a median of 177 strikes, covering 0.39 to 1.30 of spot, and
+      measured gamma on the outermost strikes is 0.010%. Coverage was never a
+      problem.
+
+      The coverage threshold was derived from a false premise. It assumed open
+      interest uniform in log-moneyness, giving "gamma beyond |z| is about
+      2(1-Phi(z))" and a cutoff of z = 2.5. Real open interest concentrates near
+      the money, so far-dated wings carry far less gamma than that implies. On
+      real SPY the test fired at min |z| = 2.26 while measured edge gamma was
+      0.010%. Both coverage flags are now anchored to the measured quantity,
+      with z demoted to corroboration.
+
+    THREE LIMITS THIS EXPOSED, which apply to every script in this repo
+
+      Synthetic validation cannot catch an error the generator also makes. Bug 6
+      passed 28 synthetic tests because the generator priced European options
+      too. Something external has to check it: here that was the implied carry
+      landing near the real policy rate minus the real dividend yield, a number
+      neither the generator nor the engine was ever told.
+
+      Single-machine validation cannot catch an error that lives between
+      machines. Bug 10 is invisible until someone else runs it. Reproducing a
+      run elsewhere is not ceremony, it is the only test covering this class.
+
+      A threshold defensible in the abstract can still be wrong against market
+      structure. Bugs 2, 3, 5, 7 and the coverage threshold are all this. Anchor
+      thresholds to a measured quantity wherever one exists.
+
+HOW TO READ THE OUTPUT
+    Self-test 29/29 and no flags fired  -> snapshot is fit for gamma work
+    Self-test fails                     -> do not look at the real numbers
+    Coverage flags fire                 -> widen the collector before more
+                                           snapshots accumulate
+    iv_zero_or_missing fires            -> yfinance failed to invert some
+                                           contracts; they are excluded, and
+                                           recomputing IV from mid is better
+
+HOW TO RUN
+    Standalone Python, no arguments, no pip install. Needs only numpy, pandas
+    and scipy, all of which Colab has preinstalled.
+
+    SNAPSHOT_DIR accepts a local folder OR a GitHub raw URL, and it defaults to
+    the URL. So in Colab you paste this file into a cell and run it: it pulls
+    the snapshot straight from the repo, no clone and no upload. Point it at a
+    different date folder to read a different day.
+
+    If the snapshots are unreachable it falls back to synthetic chains, so the
+    self-test and both controls still run with no network at all.
 """
 
-from __future__ import annotations
-
-import argparse
-import gzip
-import io
-import json
 import math
 import os
 import sys
@@ -66,13 +196,35 @@ import pandas as pd
 from scipy.optimize import brentq
 from scipy.stats import norm
 
+
+# =============================================================================
+# CONFIG
+# =============================================================================
+
+# Either a local folder, or a GitHub raw URL. pandas reads a gzipped csv straight from a
+# URL, so in Colab you need neither a clone nor an upload: point this at the repo and it
+# pulls the day you ask for. Cloning the whole repo works too but gets slower every day the
+# collector runs, because you would be downloading every snapshot to read one.
+#   local:  "data/2026-08-12"
+#   remote: "https://raw.githubusercontent.com/lachjory-source/options-data/main/data/2026-08-12"
+# PINNED TO A COMMIT, NOT TO main. The 2026-08-12 folder was written twice: a manual run
+# at 02:23 UTC and then the first scheduled run at 16:13 UTC, which silently overwrote it
+# under the same UTC date. main now holds the second one, so pointing at main would return
+# different numbers from the ones recorded in RESULTS_11-20.md and there would be no way to
+# tell a real change from a data swap. A commit SHA cannot be overwritten.
+#   pinned:  .../fdfe51d1f48f2d4bd144f60d995f4f11f9375bde/data/2026-08-12
+#   live:    .../main/data/<date>          <- use this once the collector timing is fixed
+SNAPSHOT_DIR = "https://raw.githubusercontent.com/lachjory-source/options-data/fdfe51d1f48f2d4bd144f60d995f4f11f9375bde/data/2026-08-12"
+TICKERS = ["SPY", "QQQ", "IWM"]
+RUN_SELFTEST = True                   # never turn this off
+VERBOSE_COVERAGE = True               # print the per-expiry coverage table
+
 CONTRACT_MULTIPLIER = 100.0
 SQRT_2PI = math.sqrt(2.0 * math.pi)
 
-
-# ----------------------------------------------------------------------------------
+# =============================================================================
 # Black-Scholes in forward form
-# ----------------------------------------------------------------------------------
+# =============================================================================
 
 def _phi(x: np.ndarray | float) -> np.ndarray | float:
     return np.exp(-0.5 * np.asarray(x, dtype=float) ** 2) / SQRT_2PI
@@ -142,9 +294,9 @@ def implied_vol_fwd(price, F, K, T, D, is_call, lo=1e-6, hi=5.0) -> float:
         return float("nan")
 
 
-# ----------------------------------------------------------------------------------
+# =============================================================================
 # Put-call parity: recover D and F per expiry
-# ----------------------------------------------------------------------------------
+# =============================================================================
 
 @dataclass
 class ParityFit:
@@ -220,9 +372,9 @@ def fit_parity(df: pd.DataFrame, spot: float, T: float, expiry_label: str,
     return ParityFit(expiry_label, T, int(good.sum()), D, F, r2, carry, ok, reason)
 
 
-# ----------------------------------------------------------------------------------
+# =============================================================================
 # Synthetic chains with known answers
-# ----------------------------------------------------------------------------------
+# =============================================================================
 
 def make_synthetic_chain(
     spot: float = 100.0,
@@ -339,9 +491,9 @@ def inject_defect(df: pd.DataFrame, defect: str, spot: float = 100.0, seed: int 
     return d.reset_index(drop=True)
 
 
-# ----------------------------------------------------------------------------------
+# =============================================================================
 # QA
-# ----------------------------------------------------------------------------------
+# =============================================================================
 
 @dataclass
 class QAResult:
@@ -478,6 +630,31 @@ def run_qa(df: pd.DataFrame, spot: float, verbose: bool = False) -> QAResult:
         errs and float(np.median(errs)) > 0.015
     )
 
+    # -- call vs put IV at the same strike -------------------------------------------
+    # Put-call parity implies identical implied volatility for a call and a put on the same
+    # strike and expiry. Any gap is the data provider's inversion failing, and it shows up
+    # worst in the wings, which the near-the-money iv_recompute check does not reach.
+    _pre = compute_gex(df, spot, qa_parity=fits)
+    gaps, wts = [], []
+    for (exp, k), grp in _pre.contracts.groupby(["expiry", "strike"]):
+        vals = grp["iv_used"].to_numpy(float)
+        vals = vals[np.isfinite(vals)]
+        if len(vals) >= 2:
+            gaps.append(float(vals.max() - vals.min()))
+            wts.append(float(grp["gross_gamma_dollars"].sum()))
+    gaps, wts = np.array(gaps), np.array(wts)
+    res.stats["iv_call_put_gap_n"] = len(gaps)
+    res.stats["iv_call_put_gap_median"] = float(np.median(gaps)) if len(gaps) else float("nan")
+    # The raw median is dominated by illiquid wings, where a large gap costs nothing because
+    # there is no gamma there. Weighting by gross gamma measures the disagreement where it
+    # can actually move a number. Same correction as the coverage threshold: anchor to the
+    # measured quantity, not to a count.
+    res.stats["iv_call_put_gap_gamma_wtd"] = (
+        float(np.sum(gaps * wts) / wts.sum()) if len(gaps) and wts.sum() > 0 else float("nan"))
+    res.flags["call_put_iv_inconsistent"] = bool(
+        len(gaps) and np.isfinite(res.stats["iv_call_put_gap_gamma_wtd"])
+        and res.stats["iv_call_put_gap_gamma_wtd"] > 0.02)
+
     # -- strike coverage: the question that actually matters -------------------------
     # Not "how many strikes" but "does the chain reach far enough that the missing tail
     # carries no gamma". Measured two ways: in IV-sigma units, and as the share of gross
@@ -583,9 +760,9 @@ def run_qa(df: pd.DataFrame, spot: float, verbose: bool = False) -> QAResult:
     return res
 
 
-# ----------------------------------------------------------------------------------
+# =============================================================================
 # GEX engine
-# ----------------------------------------------------------------------------------
+# =============================================================================
 
 CONVENTIONS = {
     # Retail/vendor standard: customers buy calls and sell puts, so dealers are the mirror.
@@ -605,6 +782,7 @@ class GexResult:
     by_strike: pd.DataFrame
     totals: Dict[str, float]
     flip: Dict[str, Optional[float]]
+    crossings: Dict[str, List[float]]
     top_strikes: pd.DataFrame
     parity: List[ParityFit]
 
@@ -655,12 +833,14 @@ def compute_gex(df: pd.DataFrame, spot: float, qa_parity: Optional[List[ParityFi
         **{n: (f"gex_{n}", "sum") for n in CONVENTIONS}
     ).reset_index()
 
-    flip = {}
+    crossings, flip = {}, {}
     for name in CONVENTIONS:
-        flip[name] = _solve_flip(d, spot, name, sticky=sticky)
+        cr = _flip_crossings(d, spot, name, sticky=sticky)
+        crossings[name] = cr
+        flip[name] = min(cr, key=lambda x: abs(x - spot)) if cr else None
 
     top = by_strike.reindex(by_strike["gross"].abs().sort_values(ascending=False).index).head(12)
-    return GexResult(d, by_strike, totals, flip, top, fits)
+    return GexResult(d, by_strike, totals, flip, crossings, top, fits)
 
 
 def _solve_flip(d: pd.DataFrame, spot: float, convention: str,
@@ -697,8 +877,15 @@ def _flip_crossings(d: pd.DataFrame, spot: float, convention: str,
             v = sub["iv_used"].to_numpy(float)
             ok = np.isfinite(v)
             if ok.sum() >= 3:
-                order = np.argsort(m[ok])
-                smile[str(exp)] = (m[ok][order], v[ok][order])
+                # Collapse to ONE point per log-moneyness. Under put-call parity the call and
+                # the put at a strike have the same implied volatility, so averaging is the
+                # right smile point rather than an arbitrary pick. np.unique returns sorted
+                # unique values, which also makes this deterministic: the previous version
+                # used a non-stable argsort over duplicated x and gave a different answer on
+                # a different numpy build.
+                uniq, inv = np.unique(m[ok], return_inverse=True)
+                avg = np.bincount(inv, weights=v[ok]) / np.bincount(inv)
+                smile[str(exp)] = (uniq, avg)
     exp_arr = d["expiry"].astype(str).to_numpy()
 
     net = np.zeros_like(grid)
@@ -738,9 +925,9 @@ def _flip_crossings(d: pd.DataFrame, spot: float, convention: str,
     return out
 
 
-# ----------------------------------------------------------------------------------
+# =============================================================================
 # Self-test: known answers, both directions
-# ----------------------------------------------------------------------------------
+# =============================================================================
 
 class Checks:
     def __init__(self):
@@ -846,6 +1033,29 @@ def selftest() -> bool:
     c.check("wide chain does not flag edge gamma", not qa_clean.flags["truncation_costs_gamma"],
             f"edge share={qa_clean.stats['gamma_share_at_edge_strikes']:.6f}")
 
+    # 7b. The sticky-moneyness smile must have STRICTLY INCREASING x. Every strike carries a
+    #     call and a put at the same log-moneyness, so a naive build produces ties, np.interp
+    #     goes undefined, and a non-stable sort makes the result vary by numpy build. This
+    #     asserts the property directly rather than hoping the output looks stable.
+    dsk, _ = make_synthetic_chain(spot=100.0, skew=-0.6)
+    dsk_c = compute_gex(dsk, 100.0).contracts
+    _sm = {}
+    for _exp, _sub in dsk_c.groupby("expiry"):
+        _m = np.log(_sub["strike"].to_numpy(float) / _sub["F"].to_numpy(float))
+        _v = _sub["iv_used"].to_numpy(float)
+        _ok = np.isfinite(_v)
+        _u, _inv = np.unique(_m[_ok], return_inverse=True)
+        _sm[str(_exp)] = _u
+    _strict = all(np.all(np.diff(u) > 0) for u in _sm.values())
+    c.check("sticky-moneyness smile x is strictly increasing (no ties)", _strict,
+            f"{sum(len(u) for u in _sm.values())} unique points across {len(_sm)} expiries")
+
+    # 7c. Same chain, same code, twice -> identical flip. Guards the non-determinism directly.
+    _f1 = _solve_flip(dsk_c, 100.0, "long_call_short_put", sticky="moneyness")
+    _f2 = _solve_flip(compute_gex(dsk, 100.0).contracts, 100.0, "long_call_short_put",
+                      sticky="moneyness")
+    c.check("sticky-moneyness flip is reproducible", _f1 == _f2, f"{_f1} vs {_f2}")
+
     # 8. Symmetric OI -> flip level at spot.
     dsym, _ = make_synthetic_chain(spot=100.0, r=r, q=q, oi_mode="symmetric")
     gsym = compute_gex(dsym, 100.0)
@@ -895,9 +1105,17 @@ def selftest() -> bool:
     return c.report()
 
 
-# ----------------------------------------------------------------------------------
+# =============================================================================
 # Real snapshot I/O
-# ----------------------------------------------------------------------------------
+# =============================================================================
+
+def _is_url(p: str) -> bool:
+    return p.startswith("http://") or p.startswith("https://")
+
+
+def _join(base: str, name: str) -> str:
+    return base.rstrip("/") + "/" + name if _is_url(base) else os.path.join(base, name)
+
 
 COLUMN_ALIASES = {
     "strike": ["strike", "Strike", "strike_price"],
@@ -938,7 +1156,10 @@ def load_snapshot(path: str, spot: Optional[float] = None,
 
     # as-of date: prefer the folder name, since that is the collection date.
     if asof is None:
-        folder = os.path.basename(os.path.dirname(os.path.abspath(path)))
+        if _is_url(path):
+            folder = path.rstrip("/").rsplit("/", 2)[-2]
+        else:
+            folder = os.path.basename(os.path.dirname(os.path.abspath(path)))
         asof = folder if len(folder) == 10 and folder[4] == "-" else None
     if asof is None:
         raise SystemExit("could not infer snapshot date from folder; pass --asof YYYY-MM-DD")
@@ -971,12 +1192,12 @@ def report(df: pd.DataFrame, spot: float, label: str) -> None:
     qa = run_qa(df, spot, verbose=False)
     print(qa)
 
-    print("\nPER-EXPIRY COVERAGE")
-    cov = qa.stats["_coverage_table"]
-    show = cov.copy()
-    for col in ("k_min_pct", "k_max_pct", "atm_iv", "z_dn", "z_up"):
-        show[col] = show[col].map(lambda v: f"{v:.3f}" if np.isfinite(v) else "nan")
-    print(show.to_string(index=False))
+    if VERBOSE_COVERAGE:
+        print("\nPER-EXPIRY COVERAGE")
+        show = qa.stats["_coverage_table"].copy()
+        for col in ("k_min_pct", "k_max_pct", "atm_iv", "z_dn", "z_up"):
+            show[col] = show[col].map(lambda v: f"{v:.3f}" if np.isfinite(v) else "nan")
+        print(show.to_string(index=False))
 
     gex = compute_gex(df, spot, qa_parity=qa.parity)
     print("\nGEX TOTALS  ($ gamma per 1% move in spot)")
@@ -984,7 +1205,7 @@ def report(df: pd.DataFrame, spot: float, label: str) -> None:
         print(f"  {k:<32} {v:>20,.0f}")
     print("\nZERO-GAMMA FLIP LEVEL (re-priced across a spot grid, sticky-strike)")
     for k, v in gex.flip.items():
-        n_cross = len(_flip_crossings(gex.contracts, spot, k))
+        n_cross = len(gex.crossings[k])
         s = f"{v:,.2f}  ({v/spot - 1:+.2%} from spot)" if v is not None else "no crossing in +/-20% grid"
         print(f"  {k:<32} {s}   [{n_cross} crossing(s)]")
     print("\n  sticky-moneyness comparison:")
@@ -1015,28 +1236,101 @@ def report(df: pd.DataFrame, spot: float, label: str) -> None:
         print("VERDICT: no QA flags fired. Snapshot is fit for gamma work.")
     print("-" * 78)
 
+# =============================================================================
+# SYNTHETIC SPY-SHAPED SNAPSHOTS, used as positive and negative controls
+# =============================================================================
 
-def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--selftest", action="store_true", help="run known-answer tests and exit")
-    ap.add_argument("--snapshot", help="path to a snapshot csv or csv.gz")
-    ap.add_argument("--spot", type=float, default=None)
-    ap.add_argument("--asof", default=None, help="YYYY-MM-DD; defaults to the parent folder name")
-    ap.add_argument("--label", default=None)
-    args = ap.parse_args(argv)
+def demo_strike_ladder(spot: float, mode: str, dte: int) -> np.ndarray:
+    """narrow = the geometry a truncating API would produce.
+    wide   = a realistic ladder, $1 near the money widening to $5, growing with
+             maturity. Per-expiry variation makes this a proper negative control
+             for the strike_count_capped detector."""
+    if mode == "narrow":
+        base = round(spot)
+        return np.arange(base - 24, base + 24, 1.0)
+    span = 0.28 + 0.55 * math.sqrt(dte / 365.0)
+    lo, hi = (1 - span) * spot, (1 + span) * spot
+    near_lo, near_hi = round(0.93 * spot), round(1.07 * spot)
+    near = np.arange(near_lo, near_hi + 1, 1.0)
+    far_lo = np.arange(round(lo / 5) * 5, near_lo, 5.0)
+    far_hi = np.arange(near_hi + 5, hi, 5.0)
+    return np.unique(np.concatenate([far_lo, near, far_hi]))
 
-    if args.selftest or not args.snapshot:
-        ok = selftest()
-        if not args.snapshot:
-            return 0 if ok else 1
-        if not ok:
+
+def _demo_expiries(asof: pd.Timestamp) -> List[pd.Timestamp]:
+    """Dailies for the first two weeks, then Fridays, then monthlies. This is the shape a
+    real SPY chain has (17 expiries inside 90 days), not one per business day."""
+    out = list(pd.bdate_range(asof + pd.Timedelta(days=1), asof + pd.Timedelta(days=11)))
+    fridays = pd.bdate_range(asof + pd.Timedelta(days=12), asof + pd.Timedelta(days=90))
+    out += [d for d in fridays if d.weekday() == 4]
+    return out
+
+
+def make_demo_snapshot(mode: str = "wide", spot: float = 770.56,
+                       r: float = 0.042, q: float = 0.011,
+                       seed: int = 11) -> Tuple[pd.DataFrame, float]:
+    """SPY-shaped chain with a realistic skew and open-interest profile. Quotes
+    are generated by pricing at the true IV, so inverting them must recover it."""
+    rng = np.random.default_rng(seed)
+    asof = pd.Timestamp("2026-08-12")
+    rows = []
+    for d in _demo_expiries(asof):
+        dte = (d - asof).days
+        T = dte / 365.0
+        D = math.exp(-r * T)
+        F = spot * math.exp((r - q) * T)
+        Ks = demo_strike_ladder(spot, mode, dte)
+        lm = np.log(Ks / F)
+        atm = 0.125 + 0.03 * math.sqrt(T)
+        iv = np.clip(atm - 0.55 * lm / (1 + 3 * T) + 1.4 * lm ** 2, 0.05, 2.0)
+        monthly = 3.5 if (15 <= d.day <= 21 and d.weekday() == 4) else 1.0
+        w = np.exp(-0.5 * (lm / 0.055) ** 2)
+        oi_c = rng.poisson(np.maximum(0, 9000 * monthly * w * (1 + 0.4 * np.tanh(lm / 0.05))))
+        oi_p = rng.poisson(np.maximum(0, 9000 * monthly * w * (1 - 0.7 * np.tanh(lm / 0.05))))
+        for is_call, oi_arr, tag in ((True, oi_c, "C"), (False, oi_p, "P")):
+            px = bs_price_fwd(F, Ks, T, iv, D, is_call)
+            half = np.maximum(0.01, 0.005 * np.maximum(px, 0.05))
+            for K, s_, m_, h_, oi_ in zip(Ks, iv, px, half, oi_arr):
+                rows.append({"strike": float(K), "expiry": d.strftime("%Y-%m-%d"),
+                             "dte": dte, "type": tag, "openInterest": float(oi_),
+                             "impliedVolatility": float(s_),
+                             "bid": float(max(0.0, m_ - h_)), "ask": float(m_ + h_),
+                             "spot": spot})
+    return pd.DataFrame(rows), spot
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main():
+    if RUN_SELFTEST:
+        if not selftest():
             print("\nSELF-TEST FAILED. Refusing to run on real data.")
-            return 1
+            sys.exit(1)
 
-    df, spot = load_snapshot(args.snapshot, args.spot, args.asof)
-    report(df, spot, args.label or os.path.basename(args.snapshot))
-    return 0
+    loaded = []
+    for t in TICKERS:
+        src = _join(SNAPSHOT_DIR, f"{t}.csv.gz")
+        if not _is_url(src) and not os.path.exists(src):
+            continue
+        try:
+            loaded.append((t, load_snapshot(src)))
+        except Exception as e:
+            print(f"  could not load {t}: {type(e).__name__}: {e}")
+
+    if not loaded:
+        print(f"\nNo snapshots reachable at {SNAPSHOT_DIR!r}.")
+        print("Falling back to synthetic chains so the detectors still demonstrate.\n")
+        for mode in ("wide", "narrow"):
+            df, spot = make_demo_snapshot(mode)
+            report(df, spot, f"SYNTHETIC {mode} (not real data)")
+            print()
+        return
+
+    for t, (df, spot) in loaded:
+        report(df, spot, t)
+        print()
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+main()
