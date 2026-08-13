@@ -172,6 +172,83 @@ and zero-day options grew over exactly this period, so gamma now rolls off
 continuously instead of piling into one monthly cliff. That is a hypothesis
 fitted to the timing, not something tested here.
 
+### 11 — Gamma exposure: is the collected snapshot fit to use?
+
+Not a strategy test, and not an analysis of the collected data. Collection
+started 12 August 2026, so there is one snapshot and nothing can be concluded
+from it about gamma or about price.
+
+This asks whether the collector is configured correctly, which is a question
+that needs exactly one snapshot and gains nothing from the second. It was run on
+day one because a config problem found now is a config change, and the same
+problem found in six months costs six months of collection.
+
+Engine validated on synthetic chains first: **31 known-answer tests**, checking
+both directions. Detectors must fire on injected defects and stay silent on
+clean data.
+
+| | SPY | QQQ | IWM |
+|---|---|---|---|
+| Contracts | 5,736 | 5,299 | 1,940 |
+| Expiries | 17 | 17 | 15 |
+| Median strikes/expiry | 177 | 193 | 85 |
+| Strike range (x spot) | 0.39 - 1.30 | 0.29 - 1.53 | 0.30 - 1.33 |
+| Parity regression median R2 | 0.9999 | 0.9999 | 1.0000 |
+| Implied carry (r - q) | +2.89% | +3.17% | +1.65% |
+| Gross gamma at edge strikes | 0.010% | 0.019% | 0.014% |
+| Unusable IV | 2.51% | 0.68% | 1.60% |
+| Call-vs-put IV gap, gamma-weighted | 3.25 pts | 3.32 pts | 3.59 pts |
+
+**The collector does not need a config change.** Coverage, open interest and
+quote integrity are all fine.
+
+**But the stored implied volatility field should not be used.** Put-call parity
+says a call and a put on the same strike must have identical implied volatility.
+In yfinance's `impliedVolatility` column they disagree by over 3 volatility
+points even after weighting by gross gamma, so the gap is not confined to
+illiquid wings. Gamma is a function of IV and inherits the error. Bid and ask are
+already stored, so this is fixed at analysis time by re-inverting the mid price:
+an argument for the store-raw-derive-later design rather than against it.
+
+The implied carry is the strongest independent check. Nothing in the pipeline is
+told the interest rate or the dividend yield; both fall out of a put-call parity
+regression on the quotes. Getting +2.9% for SPY against a roughly 4.2% policy
+rate and a 1.1% distribution yield is a number that would not appear if the
+pricer, the forward recovery or the expiry parsing were wrong.
+
+**One real defect, and it is a timing discontinuity rather than a config
+problem.** The 2026-08-12 snapshot was the manual first run, taken at 02:23 UTC,
+which is 10:23pm New York on the 11th. At that hour spot is the 11 August close
+but open interest is still 10 August, because the OCC publishes overnight. Every
+scheduled 13:00 UTC run has spot and open interest aligned to the same prior
+session. **Row one of the dataset uses a different date offset from every row
+after it.** Same shape as the Binance millisecond-to-microsecond switch: a
+convention change mid-series that produces plausible numbers instead of an error.
+
+**A negative result on the dealer sign convention, before any data was needed.**
+If convention B is the exact negation of convention A, the zero-gamma flip level
+is identical under both and only the interpretation flips. So "test A against B"
+is one correlation whose sign you read, not two competing models. The only
+implemented convention that genuinely moves the flip level is the
+moneyness-conditional one, and on real data it produces **8 zero crossings on
+SPY and 12 on QQQ**, because each strike flips sign as spot sweeps past it. Any
+vendor quoting "the" flip level under that convention is picking one crossing
+out of eight.
+
+**And the six-month plan does not have the sample size.** Net GEX is a stock
+variable, so daily observations are heavily autocorrelated.
+
+| True correlation | Independent observations needed |
+|---|---|
+| 0.10 | 783 |
+| 0.20 | 194 |
+| 0.40 | 47 |
+
+125 trading days at AR(1) = 0.95 is an effective sample size of **3.2**. Test
+changes in GEX rather than levels: differencing turns the stock into a flow, and
+monthly expiry is the largest natural experiment in the dataset, which connects
+directly to tests 09 and 10.
+
 ---
 
 ## What this adds up to
@@ -184,6 +261,14 @@ The most reusable output is not a strategy. It is the +0.15R optimisation lift:
 a measured quantity for how much apparent edge a small parameter search
 fabricates from nothing.
 
+Test 11 added a second one, about the method rather than the markets. Every
+script here validates against synthetic data before touching real data, and that
+caught real bugs. But test 11's engine passed 28 synthetic tests and then broke
+on first contact with a live SPY chain, because the generator and the engine
+shared a European-options assumption that real American ETF options violate.
+**Synthetic validation cannot catch an error the generator also makes.** It is a
+necessary step, not a sufficient one.
+
 ---
 
 ## Running these
@@ -192,6 +277,13 @@ Each file is standalone Python. Paste into a Colab notebook and run.
 
 Data sources: Binance public archives (crypto, free), Dukascopy via
 `dukascopy-python` (index CFDs, free), Deribit DVOL API (crypto implied
-volatility, free).
+volatility, free), and `data/` in this repo for option chains, which exists
+because per-strike open interest history is not sold cheaply and no free source
+of it was found.
 
-Some scripts need `!pip install dukascopy-python` in a cell first.
+Some scripts need `!pip install dukascopy-python` in a cell first. Test 11 needs
+nothing installed and no clone: it reads `data/` from this repo over https, so
+pasting it into a cell reproduces the run. Point `SNAPSHOT_DIR` at a different
+date folder to read a different day, or at a local path to work offline. If the
+snapshots are unreachable it falls back to synthetic chains, so the self-test
+and both controls still run with no network.
