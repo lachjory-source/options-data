@@ -1,0 +1,35 @@
+{
+  "utc": "2026-08-19T14:58:01.086830+00:00",
+  "session": "2026-08-18",
+  "ran_during_market_hours": true,
+  "minutes_late": 118.0,
+  "versions": {
+    "yfinance": "1.6.0",
+    "pandas": "3.0.5",
+    "python": "3.11.15"
+  },
+  "collector_run": "32267146152",
+  "tickers": {
+    "SPY": {
+      "spot": 767.4500122070312,
+      "spot_live": 771.6900024414062,
+      "session": "2026-08-18",
+      "contracts": 5538,
+      "kb": 161.5
+    },
+    "QQQ": {
+      "spot": 717.510009765625,
+      "spot_live": 718.0814208984375,
+      "session": "2026-08-18",
+      "contracts": 5057,
+      "kb": 150.2
+    },
+    "IWM": {
+      "spot": 300.2300109863281,
+      "spot_live": 302.8900146484375,
+      "session": "2026-08-18",
+      "contracts": 1894,
+      "kb": 53.2
+    }
+  }
+}
